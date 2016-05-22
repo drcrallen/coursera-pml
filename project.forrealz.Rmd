@@ -1,0 +1,298 @@
+---
+title: "Predicting Unilateral Dumbbell Biceps Curl Form Correctness Utilizing Sensor Readings"
+author: "Charles Allen"
+date: "May 21, 2016"
+output: html_document
+bibliography: bibliography.bib
+---
+
+This analysis looks at a Weight Lifting Exercises Dataset[-@Velloso2013] data as published by Velloso, et al. The dataset focuses on the form correctness of a Unilateral Dumbbell Biceps Curl excercise. Participants are asked to perform the excercise either true to form, or with a various quantity of deficienceis.
+
+Each exercise consisted of 10 repetitions in each of the following manners:
+
+|Classification|Description|
+|--------------|------------|
+|A|To specification|
+|B|Elbows to the front|
+|C|Half-lift|
+|D|Half-drop|
+|E|Hips to front|
+
+Class A is considered perfect form, and classes B, C, D, and E are imperfect forms.
+
+Readers interested in more information are directed to the [dataset author's web site](http://groupware.les.inf.puc-rio.br/har)
+
+# Data Source
+
+The source data is acquired from the web for local use.
+```{r, cache=TRUE, echo = TRUE}
+library(ggplot2)
+library(caret)
+library(knitr)
+# For repeatability
+set.seed(431798143)
+resource_address <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+# Original data from http://groupware.les.inf.puc-rio.br/static/WLE/WearableComputing_weight_lifting_exercises_biceps_curl_variations.csv
+training_raw <- read.csv(resource_address, header=TRUE, na.strings="NA", strip.white=TRUE)
+```
+
+
+```{r, echo = TRUE, cache = TRUE}
+# Go ahead and load this because training data is nothing like the test data. So we need to know what is available in the test data
+resource_address <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+testing_raw <- read.csv(resource_address, header=TRUE, na.strings="NA", strip.white=TRUE)
+```
+
+
+# Data Cleanup
+Basic data cleanup is performed. This mostly involves coercing data types into things that R understands, and removing the `#DIV/0!` in the data, replacing it with `NA`.
+```{r, echo = TRUE}
+
+# These are for proper time formatting
+options(digits.secs = 6)
+options(digits = 16)
+
+explore_prepare <- function(df) {
+    cleaned <- df[2:ncol(df)]
+    div0 <- cleaned == "#DIV/0!"
+    cleaned[div0] <- NA
+    as.numeric.factor <- function(x) {as.numeric(levels(x))[x]}
+    numericCols <- 7:(ncol(cleaned) - 1)
+    factorCols <- sapply(numericCols, function(x){class(cleaned[,x]) == "factor"})
+    cleaned[,numericCols[factorCols]] <- as.numeric(as.character(unlist(cleaned[,numericCols[factorCols]])))
+    cleaned$measurement_time <- as.POSIXlt(cleaned$raw_timestamp_part_1 + cleaned$raw_timestamp_part_2 / 1e6, origin = "1970-01-01", tz = "UTC")
+    cleaned
+}
+
+training_explore <- explore_prepare(training_raw)
+
+```
+
+# Data Exploration
+
+The data can be explored to determine what features it has that are important.
+One item to note is that the participants were asked to do 10 reps of the exercise for each case.
+As such, we would expect some of the measurements to have a strong periodicity.
+
+```{r, echo = TRUE, fig.width=8, fig.height=6}
+library(ggplot2)
+ggplot(training_explore, aes(x = measurement_time, y = roll_belt)) + geom_line() + facet_wrap( user_name ~ classe, scales = "free")
+```
+
+The cluster of charts above shows that there are many different patterns in the exercises that each participant conducted. There are certainly some periodic patterns, and certainly some datapoints that seem completely unrelated to reps that were occuring during the exercise.
+
+To further investigate the periodicity aspect, we need to clean up the data a bit more. To clean the data, simple interpolation is performed on an evenly spaced mesh. This allows further analysis to take advantage of optimizations and analysis that rely on an evenly spaced mesh.
+
+```{r, echo = TRUE}
+
+evenspace <- function(df){
+    lapply(split(df, list(df$user_name, df$classe)), function(x){
+        start <- min(x$measurement_time)
+        end <- max(x$measurement_time)
+        xout <- seq(from = as.numeric(start), to = as.numeric(end), length.out = length(x$measurement_time))
+
+        no_nacols <- sapply(1:length(names(x)), function(y){sum(is.na(x[,y])) == 0})
+        #x <- x[,no_nacols]
+        ignored <- sapply(7:(length(names(x)) - 2), function(y){
+            if(no_nacols[y]){
+                x[,y] <- approx(as.numeric(x$measurement_time), x[,y], xout = xout)$y
+            }
+        })
+        x$measurement_time <- as.POSIXlt(xout, origin = "1970-01-01", tz = "UTC")
+        x
+    })
+}
+
+training_evenspace <- evenspace(training_explore)
+```
+
+We can see that there are some exercises and individuals who presented with very strong periodicity during their exercise.
+
+```{r, echo = TRUE, fig.width=6, fig.height=4}
+ggplot(training_evenspace[["eurico.D"]], aes(x = measurement_time, y = roll_belt)) + geom_line() + labs(title = "Periodic roll_belt data example")
+```
+
+And we can see others who did not exhibit any discernable pattern during the course of the exercise for the same metric.
+
+```{r, echo = TRUE, fig.width=6, fig.height=4}
+ggplot(training_evenspace[["charles.A"]], aes(x = measurement_time, y = roll_belt)) + geom_line() + labs(title = "NOT Periodic roll_belt data example")
+```
+
+It is now of interest to reduce our total datasize to make it more consumable by something like a random forest.
+
+The key things we will keep are:
+
+1. Variables rolled up per window. These will be averaged per user-exercise.
+2. The RMS of the middle 80% of the time range of the exercise. Many of the plots have jitter or unusable data near the start or end, so only the middle 80% of the gathered data is used for RMS calculation.
+3. The "density ratio" in fourier space of occurances near the 8~25 times across the measurement range. This is intended to capture activity that occurs a number of times one would expect that are caused by an exercise repeated 10 times during the course of the measurement. This is a ratio of the magnitude squared of the fourier-space plot between indicies 8 and 25 (meaning they show a periodic occurance between 8 and 25 times across the course of the measurement).
+
+```{r, echo = TRUE}
+
+data_reduce <- function(data_list, total_df) {
+    na_columns <- sapply(colnames(total_df), function(y){sum(is.na(total_df[[y]])) != 0})
+    all_cols <- 1:length(colnames(total_df))
+    interesting_columns <- all_cols[(!na_columns) & (all_cols >= 7) & (all_cols <= (length(colnames(total_df)) - 2))]
+
+    #between 10 and 20 per sample range
+    fft_range <- 8:25;
+    df_reduced <- do.call("rbind", lapply(data_list, function(x){
+        num_values <- length(x[,1])
+        middle <- round(num_values / 2)
+        half_count <- round(num_values * 0.4)
+        idex <- (middle - half_count) : (middle + half_count)
+    
+        # Some extra data from full time-series
+        retval <- do.call("rbind", lapply(colnames(x)[interesting_columns], function(y){
+            fft_measure <- abs(fft(x[[y]]))
+            de <- sum(fft_measure^2)
+            if(de > 0) {
+                dens <- sum(fft_measure[fft_range]^2) / de
+            } else {
+                dens <- 0
+            }
+            rms <- sqrt(sum(x[[y]]^2) / num_values)
+            data.frame(metric = y, rms = rms, spec_dens = dens)
+        }))
+    
+        retval <- do.call("cbind", split(retval[,c("rms", "spec_dens")], retval$metric))
+        # Get some data from the NA columns
+        naColNames <- colnames(x)[na_columns]
+        meanNA <- sapply(naColNames, function(y) {
+            mean(x[[y]], na.rm = TRUE)
+        })
+        retval[,naColNames] <- meanNA
+        retval$user_name <- x$user_name[1]
+        retval$classe <- x$classe[1]
+        retval
+    }))
+}
+
+training_reduced <- data_reduce(training_evenspace, training_explore)
+```
+
+Finally, we will fit our data to the reduced dataset collected using a random forest to start out with. One advantage of a random forest is that it provides insight into the aspects of the data which have larger contributions to the decision.
+
+```{r, echo = TRUE}
+fit_exploration_model <- function(df) {
+    reduced_no_user <- df[,7:(length(names(df)))]
+    good_cols <- sapply(colnames(reduced_no_user), function(x) {
+        col <- reduced_no_user[[x]]
+        if(!is.numeric(col)) {
+            TRUE
+        } else {
+            num_bad <- sum(is.na(col))
+            (num_bad  == 0) & (var(col) > 0)#< (length(col) / 2)
+        }
+    })
+    reduced_no_user <- reduced_no_user[,good_cols & colnames(reduced_no_user) != "user_name"]
+    caret::train(classe ~ ., data = reduced_no_user, method = "rf")
+}
+
+modelFit_explore <- fit_exploration_model(training_reduced)
+mi <- data.frame(importance = modelFit_explore$finalModel$importance[,1], metric =  row.names(modelFit_explore$finalModel$importance))
+mi <- mi[order(-mi$importance),]
+```
+
+
+Finally, we can investigate the top performers by their Gini
+
+```{r, echo = TRUE}
+knitr::kable(mi, caption = "Top influencers on random forest walking decisions on reduced data", row.names = FALSE)
+
+```
+
+
+# Building a Data Model
+
+The top few items from our reduced dataset are chosen. And since the test dataset does not have enough timeseries data to do RMS or fourier analysis, we will instead use these results to guide us in how we choose our candidates for predictors.
+
+The top 8 values whose RMS shows up as most influential are chosen as an initial training point.
+
+
+```{r, echo=TRUE}
+
+initial_cleanup <- function(df) {
+# magnet_dumbbell_x.rms          0.228084927391449060          magnet_dumbbell_x.rms
+# gyros_forearm_x.rms            0.231295233535851463            gyros_forearm_x.rms
+# stddev_roll_belt               0.232085879338053247               stddev_roll_belt
+# amplitude_pitch_belt           0.232635562624659425           amplitude_pitch_belt
+# var_total_accel_belt           0.254630709841451475           var_total_accel_belt
+# magnet_forearm_y.spec_dens     0.256219770288191262     magnet_forearm_y.spec_dens
+# accel_arm_x.rms                0.261853007772801794                accel_arm_x.rms
+# var_roll_belt                  0.276177822261494343                  var_roll_belt
+# stddev_pitch_belt              0.346830846055277364              stddev_pitch_belt
+# gyros_dumbbell_y.rms           0.352877798809377807           gyros_dumbbell_y.rms
+# magnet_arm_x.spec_dens         0.468409990433580448         magnet_arm_x.spec_dens
+# magnet_arm_z.spec_dens         0.478719778800341444         magnet_arm_z.spec_dens
+# var_accel_dumbbell             0.566443560576364580             var_accel_dumbbell
+# kurtosis_yaw_arm               0.600772130526478487               kurtosis_yaw_arm
+# gyros_arm_y.rms                0.839039496714977906                gyros_arm_y.rms
+# magnet_belt_y.spec_dens        1.033955575409768013        magnet_belt_y.spec_dens
+# magnet_arm_x.rms               1.276711040078659876               magnet_arm_x.rms
+# magnet_belt_z.spec_dens        1.326950293780492673        magnet_belt_z.spec_dens
+# gyros_dumbbell_y.spec_dens     1.505127796060896417     gyros_dumbbell_y.spec_dens
+# magnet_dumbbell_x.spec_dens    1.656267593506387970    magnet_dumbbell_x.spec_dens
+# magnet_forearm_x.rms           2.206472764942390974           magnet_forearm_x.rms
+    
+    importantColumns <- c("magnet_forearm_x", "magnet_arm_x", "gyros_arm_y", "gyros_dumbbell_y", "accel_arm_x", "accel_arm_x", "gyros_forearm_x",  "magnet_dumbbell_x", "classe", "problem_id")
+    
+    is_important_column <- sapply(colnames(df), function(x){
+        x %in% importantColumns
+    })
+    df <- df[,is_important_column]
+    df
+}
+
+testing <- initial_cleanup(testing_raw)
+training <- initial_cleanup(training_raw)
+
+```
+
+
+Another random forest model can be built using the entire training data set for the specified predictors. *Cross Validation* is handled within the model itself, and there is no extra effort put forth here to do cross validation.
+
+```{r, echo = TRUE}
+
+rf_model <- randomForest(training[,colnames(training) != "classe"], training$classe)
+
+knitr::kable(rf_model$confusion, caption = "Confusion Matrix for Training Data for OOB error")
+
+```
+
+The expected Out of bounds error is shown above, and looks acceptable for a first-shot.
+
+# Testing
+Now that we have a reasonable model, we can use that model to predict our testing set.
+
+According to the quiz results, these results were 100% accurate.
+```{r, echo = TRUE}
+testing$predicted_vals <- predict(rf_model, testing)
+testing_results <- testing[,c("problem_id", "predicted_vals")]
+#    problem_id predicted_vals
+# 1           1              B
+# 2           2              A
+# 3           3              B
+# 4           4              A
+# 5           5              A
+# 6           6              E
+# 7           7              D
+# 8           8              B
+# 9           9              A
+# 10         10              A
+# 11         11              B
+# 12         12              C
+# 13         13              B
+# 14         14              A
+# 15         15              E
+# 16         16              E
+# 17         17              A
+# 18         18              B
+# 19         19              B
+# 20         20              B
+
+knitr::kable(testing_results, row.names = FALSE)
+```
+
+
+
+# References
